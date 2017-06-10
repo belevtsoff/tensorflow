@@ -221,6 +221,16 @@ class _BaseAttentionMechanism(AttentionMechanism):
   def alignments_size(self):
     return self._alignments_size
 
+  @property
+  def alignment_state_size(self):
+    """Returns an empty tuple by default. Override this if your
+    AttentionMechanism has state.
+
+    Returns:
+        Empty tuple
+    """
+    return ()
+
   def initial_alignments(self, batch_size, dtype):
     """Creates the initial alignment values for the `AttentionWrapper` class.
 
@@ -239,6 +249,26 @@ class _BaseAttentionMechanism(AttentionMechanism):
     """
     max_time = self._alignments_size
     return _zero_state_tensors(max_time, batch_size, dtype)
+
+  def initial_alignment_state(self, batch_size, dtype):
+    """Creates the initial alignment state for the `AttentionWrapper` class.
+
+    This is important for AttentionMechanisms that depend on previous
+    alignments AND use some kind of parametrized probability functions (e.g.
+    Gaussian mixtures in Graves attention). In such cases, parameters of the
+    previous distribution cannot be inferred for the distribution itself, so
+    they have to be passed explicitly.
+
+    The default behavior is to return an empty tuple
+
+    Args:
+      batch_size: `int32` scalar, the batch_size.
+      dtype: The `dtype`.
+
+    Returns:
+        Empty tuple
+    """
+    return ()
 
 
 class LuongAttention(_BaseAttentionMechanism):
@@ -303,7 +333,8 @@ class LuongAttention(_BaseAttentionMechanism):
     self._scale = scale
     self._name = name
 
-  def __call__(self, query, previous_alignments):
+  def __call__(self, query, previous_alignments,
+               **unused_kwargs):
     """Score the query based on the keys and values.
 
     Args:
@@ -317,6 +348,7 @@ class LuongAttention(_BaseAttentionMechanism):
       alignments: Tensor of dtype matching `self.values` and shape
         `[batch_size, alignments_size]` (`alignments_size` is memory's
         `max_time`).
+      alignment_state: empty tuple
 
     Raises:
       ValueError: If `key` and `query` depths do not match.
@@ -355,7 +387,7 @@ class LuongAttention(_BaseAttentionMechanism):
         score = g * score
 
     alignments = self._probability_fn(score, previous_alignments)
-    return alignments
+    return alignments, ()
 
 
 class BahdanauAttention(_BaseAttentionMechanism):
@@ -424,7 +456,8 @@ class BahdanauAttention(_BaseAttentionMechanism):
     self._normalize = normalize
     self._name = name
 
-  def __call__(self, query, previous_alignments):
+  def __call__(self, query, previous_alignments,
+               **unused_kwargs):
     """Score the query based on the keys and values.
 
     Args:
@@ -438,6 +471,7 @@ class BahdanauAttention(_BaseAttentionMechanism):
       alignments: Tensor of dtype matching `self.values` and shape
         `[batch_size, alignments_size]` (`alignments_size` is memory's
         `max_time`).
+      alignment_state: empty tuple
     """
     with variable_scope.variable_scope(None, "bahdanau_attention", [query]):
       processed_query = self.query_layer(query) if self.query_layer else query
@@ -466,13 +500,13 @@ class BahdanauAttention(_BaseAttentionMechanism):
                                     [2])
 
     alignments = self._probability_fn(score, previous_alignments)
-    return alignments
+    return alignments, ()
 
 
 class AttentionWrapperState(
     collections.namedtuple("AttentionWrapperState",
                            ("cell_state", "attention", "time", "alignments",
-                            "alignment_history"))):
+                            "alignment_state", "alignment_history"))):
   """`namedtuple` storing the state of a `AttentionWrapper`.
 
   Contains:
@@ -482,6 +516,8 @@ class AttentionWrapperState(
     - `attention`: The attention emitted at the previous time step.
     - `time`: int32 scalar containing the current time step.
     - `alignments`: The alignment emitted at the previous time step.
+    - `alignment_state`: The alignment state emitted at the previous time step.
+          Its type depends on the attention mechanism. Default is empty.
     - `alignment_history`: (if enabled) a `TensorArray` containing alignment
        matrices from all time steps.  Call `stack()` to convert to a `Tensor`.
   """
@@ -636,6 +672,7 @@ class AttentionWrapper(rnn_cell_impl.RNNCell):
         cell_state=self._cell.state_size,
         time=tensor_shape.TensorShape([]),
         attention=self._attention_size,
+        alignment_state=self._attention_mechanism.alignment_state_size,
         alignments=self._attention_mechanism.alignments_size,
         alignment_history=())  # alignment_history is sometimes a TensorArray
 
@@ -671,6 +708,8 @@ class AttentionWrapper(rnn_cell_impl.RNNCell):
           attention=_zero_state_tensors(self._attention_size, batch_size,
                                         dtype),
           alignments=self._attention_mechanism.initial_alignments(
+              batch_size, dtype),
+          alignment_state=self._attention_mechanism.initial_alignment_state(
               batch_size, dtype),
           alignment_history=alignment_history)
 
@@ -723,8 +762,10 @@ class AttentionWrapper(rnn_cell_impl.RNNCell):
       cell_output = array_ops.identity(
           cell_output, name="checked_cell_output")
 
-    alignments = self._attention_mechanism(
-        cell_output, previous_alignments=state.alignments)
+    alignments, alignment_state = self._attention_mechanism(
+        cell_output,
+        previous_alignments=state.alignments,
+        previous_alignment_state=state.alignment_state)
 
     # Reshape from [batch_size, memory_time] to [batch_size, 1, memory_time]
     expanded_alignments = array_ops.expand_dims(alignments, 1)
@@ -758,6 +799,7 @@ class AttentionWrapper(rnn_cell_impl.RNNCell):
         cell_state=next_cell_state,
         attention=attention,
         alignments=alignments,
+        alignment_state=alignment_state,
         alignment_history=alignment_history)
 
     if self._output_attention:
