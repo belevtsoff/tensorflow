@@ -53,6 +53,7 @@ _allowed_symbols = [
     "TrainingHelper",
     "BahdanauAttention",
     "LuongAttention",
+    "GravesAttention",
     "hardmax",
     "AttentionWrapperState",
     "AttentionWrapper",

@@ -43,6 +43,7 @@ __all__ = [
     "AttentionWrapperState",
     "LuongAttention",
     "BahdanauAttention",
+    "GravesAttention",
     "hardmax",
 ]
 
@@ -501,6 +502,156 @@ class BahdanauAttention(_BaseAttentionMechanism):
 
     alignments = self._probability_fn(score, previous_alignments)
     return alignments, ()
+
+
+class GravesAttention(_BaseAttentionMechanism):
+  """Implements Graves-style attention mechanism (monotonically moving mixture
+  of Gaussians) as described in:
+
+  Alex Graves
+  "Generating Sequences With Recurrent Neural Networks" 2014.
+  https://arxiv.org/abs/1308.0850
+  """
+
+  def __init__(self,
+               num_components,
+               memory,
+               memory_sequence_length=None,
+               normalize=False,
+               name="GravesAttention"):
+    """Construct the AttentionMechanism mechanism.
+
+    Args:
+      num_components: Number of Gaussians in the mixture of the alignment
+        function
+      memory: The memory to query; usually the output of an RNN encoder.  This
+        tensor should be shaped `[batch_size, max_time, ...]`.
+      memory_sequence_length (optional): Sequence lengths for the batch entries
+        in memory.  If provided, the memory tensor rows are masked with zeros
+        for values past the respective sequence lengths.
+      normalize: Whether to normalize gaussian mixtures so that they can be
+        treated as probability distributions. False by default.
+
+      name: Name to use when creating ops.
+    """
+    # We ignore probability_fn here, because this attention mechanism doesn't
+    # rely on scores (i.e. alignments depend only on the output of the
+    # attention layer)
+    dummy_probability_fn = lambda score, previous_alignments: None
+    super(GravesAttention, self).__init__(
+        query_layer=None,
+        memory_layer=None,
+        memory=memory,
+        probability_fn=dummy_probability_fn,
+        memory_sequence_length=memory_sequence_length,
+        name=name)
+    self._num_components = num_components
+    self._name = name
+    self._normalize = normalize
+
+    # Create layers for estimating GMM parameters
+    self._loc_layer = layers_core.Dense(self._num_components,
+                                        activation=math_ops.exp,
+                                        use_bias=True,
+                                        name="location_layer")
+    self._scale_layer = layers_core.Dense(self._num_components,
+                                          activation=math_ops.exp,
+                                          use_bias=True,
+                                          name="scale_layer")
+    self._imp_layer = layers_core.Dense(self._num_components,
+                                        activation=math_ops.exp,
+                                        use_bias=True,
+                                        name="importance_layer")
+
+  def __call__(self, query, previous_alignment_state, **unused_kwargs):
+    """Compute alignments based on the query vector and previous alignment
+    state.
+
+    Args:
+      query: Tensor of dtype matching `self.values` and shape
+        `[batch_size, query_depth]`.
+      previous_alignment_state: Tensor of dtype matching `self.values` and
+        shape `[batch_size, self._num_components]`. It is expected to represent
+        location parameters of every Gaussian in the alignment mixture.
+
+    Returns:
+      alignments: Tensor of dtype matching `self.values` and shape
+        `[batch_size, alignments_size]` (`alignments_size` is memory's
+        `max_time`).
+      new_alignment_state: Tensor of dtype matching `self.values` and shape
+        `[batch_size, self._num_components]`, representing locations of
+        components of the alignment GMM.
+    """
+    depth = query.get_shape()[-1]
+    dtype = query.dtype
+
+    with variable_scope.variable_scope(None, "graves_attention", [query]):
+      # Enforce monotonicity
+      location = previous_alignment_state + self._loc_layer(query)
+      scale = self._scale_layer(query)
+      importance = self._imp_layer(query)
+
+      alignments = self._gaussian_mixture(location, scale, importance,
+                                          self._normalize)
+
+    return alignments, location
+
+  def _gaussian_mixture(self, location, scale, importance, normalize=False):
+    """Compute alignments as a mixture of Gaussians.
+
+    Args:
+      location: Tensor of shape `[batch_size, self._num_components]`. Locations
+        of mixtures.
+      scale: Tensor of shape `[batch_size, self._num_components]`. Scale
+        parameters (1 / variance)
+      importance: Tensor of shape `[batch_size, self._num_components]`.
+        Multiplicative coefficient indicating component's importance in the
+        mixture.
+      normalize: Whether to normalize gaussian mixtures so that they can be
+        treated as probability distributions. False by default.
+
+    Returns:
+      alignments: Tensor of shape `[batch_size, self.alignments_size]`. If
+        `normalize=True` then every alignment vector sums up to 1 as a
+        probability distribution.
+    """
+    # create x axis for gaussians
+    dtype = self.values.dtype
+    x = math_ops.range(0, limit=math_ops.cast(self.alignments_size, dtype),
+                       dtype=self.values.dtype)
+
+    # To compute gaussian mixture we use broadcasting (along time for gaussian
+    # parameters and along batch and component for x. That is, apply gaussian
+    # equation elementwise where parameter tensors have shapes [batch_size, 1,
+    # num_components] and x has shape [1, alignment_size, 1]. The result is
+    # summed over the component axis.
+    x = array_ops.expand_dims(x, 0)
+    x = array_ops.expand_dims(x, 2)
+    location = array_ops.expand_dims(location, 1)
+    scale = array_ops.expand_dims(scale, 1)
+    importance = array_ops.expand_dims(importance, 1)
+
+    mixture = importance * math_ops.exp(-scale * (location - x) ** 2)
+    mixture = math_ops.reduce_sum(mixture, axis=2)
+
+    if normalize:
+      mixture = mixture / math_ops.reduce_sum(mixture, axis=1, keep_dims=True)
+
+    return mixture
+
+  def initial_alignment_state(self, batch_size, dtype):
+    """Gets initial alignment state. Because alignment state is mixture
+    locations in this case, we start from zeros. Because we use this method to
+    initialize alignments, we don't override `initial_alignments`.
+    """
+    location = array_ops.zeros((batch_size, self._num_components), dtype=dtype,
+                               name='initial_locations')
+
+    return location
+
+  @property
+  def alignment_state_size(self):
+    return self._num_components
 
 
 class AttentionWrapperState(
