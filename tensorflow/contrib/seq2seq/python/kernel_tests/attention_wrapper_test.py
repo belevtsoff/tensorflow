@@ -311,6 +311,38 @@ class AttentionWrapperTest(test.TestCase):
         attention_mechanism_depth=9,
         name='testLuongScaled')
 
+  def testGraves(self):
+    def create_attention_mechanism(num_units, memory, memory_sequence_length):
+      return wrapper.GravesAttention(
+          3, memory, memory_sequence_length, normalize=False)
+
+    expected_final_output = BasicDecoderOutput(
+        rnn_output=ResultSummary(
+            shape=(5, 3, 6), dtype=dtype('float32'), mean=-0.0019076293),
+        sample_id=ResultSummary(
+            shape=(5, 3), dtype=dtype('int32'), mean=2.0))
+    expected_final_state = AttentionWrapperState(
+        cell_state=LSTMStateTuple(
+            c=ResultSummary(
+                shape=(5, 9), dtype=dtype('float32'), mean=-0.0041309278),
+            h=ResultSummary(
+                shape=(5, 9), dtype=dtype('float32'), mean=-0.0020626809)),
+        attention=ResultSummary(
+            shape=(5, 6), dtype=dtype('float32'), mean=0.0052825562),
+        time=3,
+        alignments=ResultSummary(
+            shape=(5, 8), dtype=dtype('float32'), mean=0.66473311),
+        alignment_history=(),
+        alignment_state=ResultSummary(
+            shape=(5, 3), dtype=dtype('float32'), mean=3.000041))
+
+    self._testWithAttention(
+        create_attention_mechanism,
+        expected_final_output,
+        expected_final_state,
+        attention_mechanism_depth=9,
+        name='testLuongScaled')
+
   def testNotUseAttentionLayer(self):
     create_attention_mechanism = wrapper.BahdanauAttention
 
